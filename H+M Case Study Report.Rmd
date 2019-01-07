@@ -1,0 +1,695 @@
+---
+title: "H&M Data Scientist CRM Case Study Report"
+author: "Bryan Clark"
+date: "8/18/2018"
+output: 
+  pdf_document: default
+  html_document: default
+geometry: left = 1cm, right = 1cm, top = 1cm, bottom = 1.5cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 5, fig.height = 3)
+
+# libraries used in report
+library(knitr)
+library(kableExtra)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(cluster)
+library(ggthemes)
+
+# set theme for plots
+theme_set(theme_tufte())
+```
+
+## Business Understanding
+
+### Goals
+
+The goals of this Marketing CRM case study for H&M are listed below along with a prosposed analytical solution. 
+
+**1. Postcard Send-Outs**
+
+We have postcards in several markets and would like to send them to the right customer.
+  
+  + **[Response Prediction]** A model could be built to predict the propensity of a customer to make a purchase in response to receiving a postcard. This model can be run prior to each batch of postcards sent to customers. H&M can then only send postcards to customers with higher probabilities of responding to the postcard to maximize the return on investment of sending the postcards. 
+
+**2. Strategic Segmentation**
+
+We want to learn more about our customer base to support customer insight in the organization. We also want to use it for how we will work with customers, e.g. which customer groups we will target different activities.
+  
+  + **[Customer Segmentation]** A model could be built to segment customers based on various attributes such as the cateogry of prodcuts they buy, affinity for particular brands/collections, and/or their purchase behavior. This information could be used to decide which product offers, email content, messaging, and/or promotions to send to each segment of customers. Based on the number of clusters and DNA of each cluster, marketing strategies can be formed separately for each customer. 
+
+**3. New Customers**
+
+A project that works with Online customers needs our analytical help. Many customers shop once, but never come back. How do we get new customers to return?
+
+  + **[Lifecycle Segmentation]** Customers can be segmented based on their last interaction with H&M. The exact timeframes used for the development of customer journey lifecycles are dependent on purchase cadences of current customers. Marketing strategies can then be developed for each customer journey segment. For example, new customers can be provided "Thank You" messaging along with an introduction to new categories of products relevant to their first purchase and/or additional information about how to have a successful relationship with H&M. 
+
+  + **[Value Segmentation]** Customers can be segmented based on their value to H&M. The top 10% of customers are considered VIP or high-value customers, the next 60% of customers are considered medium-value customers, and the bottom 30% of customers labeled as low-value customers. Marketing offers can be adjusted to cater to each value segment. For example, potential high-value customers (based on their first/last purchase) can receive deeper offers enticing them to make another purchase while lower-value customers can receive a smaller offer. 
+
+
+## Data Sensemaking
+Each of these potential solutions assumes the data is available to move forward. Normally, we would move forward with identifying the data that could be useful for exploring each of the potential analytics solutions. However, in this case we have been provided a dataset to move forward to develop our marketing strategies. 
+
+```{r data}
+# load in provided customer dataset
+customers <- read_csv("Case_data_2018.csv")
+print(glimpse(customers))
+```
+
+**General Notes**
+
+We have a dataset that consists of 10,000 records and 18 variables. Upon first review, it seems that we have variables that provide us information around the customers first and most recent purchase timeframes, categories of purchases, purchase amounts for the last 1 and 2 years, flags for if the customer has made purchases online, is a member of the H&M club, is subscribed to emails, is sales driven (responsive to sales/promotions?), and has responded to a postcard by making a purchase. 
+
+**Feasibility of Proposed Solutions**
+
+Perhaps more importantly, it seems like we do not have data available on the number of visits/purchases for each customer, which would allow us to determine time-between-purchases to guide our customer lifecycle journey segmentation. In the absence of this data, we can use outside research to derive our customer journey segments. According to [statista](https://www.statista.com/statistics/767545/clothing-accessories-frequency-purchase-fashion-la-france/) (2018), 45% of people purchase clothing at least once every 90 days. 
+
+We should be able to move forward with each of the proposed solutions based on the dataset available. 
+
+**Data Validity Concerns**
+
+Additionally, we will have some data cleansing to do. In addiition to "." present in the dataset, the second record seems to indicate a customer with a purchase amount in the last 1 year that also has had 397 days since their last purchase. We'll need to identify potentially faulty records to remove for our modeling. It is also possible these could indicate returns or exchanges (returns if purchase value is negative and exchanges if it is 0), but we want to identify and consider removing them to be safe. 
+
+**NOTE:** We will assume that the validity of the data will not prevent us from removing forward with mining insights for this case study. Normally, we would want to address the source(s) of this data to determine why this issue exists. Is the SQL query faulty? Did someone merge multiple sources of data from different timeframes? Are there any other columns that have been corrupted? Are these exchanges?
+
+
+## Data Exploration
+
+In this section, we are going to address the data quality concerns noticed in the data sensemaking phase, explore our data further, and derive any new variables of interest for our business goals. 
+
+**Data Cleansing**
+Before we begin exploring our data, we will need to address some of our data validation concerns. 
+
+For each column that contains a "." placeholder, we are assuming the actual value should be 0. Additionally, for uniformity, we'll convert the Yes/No columns to binary numbers (1 for yes, 0 for no). 
+
+```{r cleaning}
+# columns to convert to numeric
+num_cols <- c(10:13, 16)
+customers[, num_cols] <- lapply(customers[, num_cols], as.numeric)
+customers[is.na(customers)] <- 0
+
+# Yes/No columns to 1 for Yes and 0 for No
+yes_no_cols <- c(3:8, 17:18)
+customers[yes_no_cols] <- ifelse(customers[ , yes_no_cols] == "Yes", 1, 0)
+# columns to convert to binary factors
+print(glimpse(customers))
+```
+
+Next we will explore how many rows may possibly be corrupt. If days since last purchase are 365 or less and the customer has a 0 value for purchase amount in the last year, OR if the days since last purchase are 730 or less and the customer has a 0 value for the two-year purchase total, we have a corrupt record. 
+
+```{r checks_1_2}
+# create logical checks for each scenario
+check_1 <- (customers$dayssincelast <= 365 & customers$purchlast1year == 0)
+check_2 <- (customers$dayssincelast <= 730 & customers$purchlast2years == 0)
+
+# add columns to indicate if column is flagged as potential concern
+customers$invalid <- (check_1 | check_2)
+```
+
+** Data Quality Report **
+
+As a sanity check, we will review the breakdown of our numeric and binary columns. This will help us identify any other potential issues before exploring the distributions of our variables visually. 
+
+Below, we see several interesting things of note about what our dataset contains: 
+
+  + A very high percentage (99%+) of customers have purchased jackets and swim items, and a very low percentage (< 1%) of customers have purchased eco items. Not only will those variables provide little information for our models, but any insights gleaned from this sample of customers may not be useful for customers that have not made purchases in either of jackets/swim or have made purchases in eco. 
+  + The minimum age in the dataset is 0 and the maximum age is 551, which means we have another quality issue. If we want to use this variable for analysis, we will need to address those records. 
+  + The mean is much larger than the median for `dayssincelast`, `purchlast1year`, and `purchlast2years` indicating these are skewed to the right (long tail to the right). There appear to be some outliers with our purchase columns with max values of 5x the 3rd quartile for purchases in the last year and 4x the 3rd quartile for purchases in the last two years. We'll have to address this before building our predictive and segmentation models. 
+  + In terms of ouor first goal to identify customers to target with postcards, 30% of our dataset has made a purhcase from a postcard.
+
+```{r data_quality_report}
+# create function to run summary on numeric features
+df_num_summary <- function(df, cols = NULL) {
+
+  if (is.null(cols)) {
+    num.cols <- colnames(select_if(df, is.numeric))
+  } else {
+    num.cols <- cols
+  }
+
+  df <- subset(df, select = num.cols)
+
+    df.num.summmary <- data.frame(
+      Count = round(sapply(df, length), 2),
+      Miss = round((sapply(df, function(x) sum(length(which(is.na(x)))) / length(x)) * 100), 1),
+      Card. = round(sapply(df, function(x) length(unique(x))), 2),
+      Min. = round(sapply(df, min, na.rm = TRUE), 2),
+      `25 perc.` = round(sapply(df, function(x) quantile(x, 0.25, na.rm = TRUE)), 2),
+      Median = round(sapply(df, median, na.rm = TRUE), 2),
+      Mean = round(sapply(df, mean, na.rm = TRUE), 2),
+      `75 perc.` = round(sapply(df, function(x) quantile(x, 0.75, na.rm = TRUE)), 2),
+      Max = round(sapply(df, max, na.rm = TRUE), 2),
+      `Std Dev.` = round(sapply(df, sd, na.rm = TRUE), 2)
+    ) %>%
+      rename(`1st Qrt.` = X25.perc.,
+             `3rd Qrt.` = X75.perc.,
+             `Miss Pct.` = Miss)
+
+    return(df.num.summmary)
+}
+
+customers_num_summary <- df_num_summary(df = customers)
+
+# display in table
+kable(customers_num_summary#, type = "html"
+      ) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left", 
+                latex_options = "scale_down")
+```
+
+**Data Exploration Plots**
+
+To get a better idea of the distribution of days since first/last purchase, purchases in last 1/2 years, and age, we'll create histograms of each. 
+
+*Days Since First Purchase*
+
+We see our dataset primarily contains customers that made their first purchase over 4 years ago. 
+```{r days_since_first_plot}
+ggplot(customers, aes(x = dayssincefirst)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 30) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Days Since First Purchase",
+       x = "")
+```
+
+*Days Since Last Purchase*
+
+When plotting the distribution of `dayssincelast`, we see the majority of customers have made a purchase in the last year, and there are customers that have been inactive (> 2-3 years since last purchase) that we could potentially target with reactivation campaigns.
+```{r days_since_last_plot}
+ggplot(customers, aes(x = dayssincelast)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 30) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Days Since Last Purchase",
+       x = "")
+```
+
+*Purchases in Last 1 Year*
+
+When using bins of \$25, our plot helps illustrate the outliers in our sample as the tail trails off to \$15k. 
+```{r purchase_last_year_plot}
+ggplot(customers, aes(x = purchlast1year)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 25) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Purchase Total in Last 1 Year",
+       x = "")
+```
+
+How many customers have a purchase amount greater than \$2.5k? Less than 1% of our sample spent more than $2.5k in the last year. 
+```{r}
+print(prop.table(table(customers$purchlast1year > 2500)))
+```
+
+When we remove the extreme outliers from our graph, we see most customers have spent \$25 or less in the last year. 
+```{r purchase_last_year_2500_plot}
+ggplot(customers[customers$purchlast1year <= 2500, ], aes(x = purchlast1year)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 25) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Purchase Total in Last 1 Year",
+       x = "")
+```
+
+
+*Purchases in Last 2 Year*
+
+When using bins of \$50, our plot helps illustrate the outliers in our sample as the tail trails off past \$30k. 
+```{r purchase_last_2_year_plot}
+ggplot(customers, aes(x = purchlast2years)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 50) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Purchase Total in Last 2 Years",
+       x = "")
+```
+
+How many customers have a purchase amount greater than \$5k for the last 2 years? About 1% of our sample spent more than $2.5k in the last year. 
+```{r}
+print(prop.table(table(customers$purchlast2years > 5000)))
+```
+
+```{r purchase_last_2_year_5000_plot}
+ggplot(customers[customers$purchlast2years <= 5000, ], aes(x = purchlast2years)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 50) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Purchase Total in Last 2 Years",
+       x = "")
+```
+
+*Age*
+
+When using bins of 5 year intervals, we see our issues with the min and max values of age. 
+```{r age_plot}
+ggplot(customers, aes(x = age)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 5) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Age",
+       x = "")
+```
+
+What percentage of our sample has an age greater than 85?
+```{r}
+print(prop.table(table(customers$age > 85)))
+```
+
+```{r age_adult_85_plot}
+ggplot(customers[customers$age <= 85, ], aes(x = age)) +
+  geom_histogram(aes(y =..density..), color = "black", fill = "grey", binwidth = 5) +
+  geom_density(color = "grey", alpha = 0.4) + 
+  labs(title = "Age",
+       x = "")
+```
+
+**Data Cleansing Conclusion**
+
+To further validate our dataset for modeling, we will remove the outliers found for purchase amounts and age. 1 year purchases greater than \$2,500, 2 year purchases greater than \$5,000, and ages less than 18 and greater than 85 will be removed. Unsure of legality of marketing directly to non-adults, we will play it safe and remove those under 18 from the sample. 
+```{r checks_3_4_5}
+# create logical checks for each purchase scenario
+check_3 <- (customers$purchlast1year > 2500)
+check_4 <- (customers$purchlast2years > 5000)
+check_5 <- (customers$age < 18 | customers$age > 85)
+
+# add columns to indicate if column is flagged as potential concern
+customers$invalid <- (check_1 | check_2 | check_3 | check_4 | check_5)
+```
+
+How much of our sample do we have remaining? We are able to retain 98% of the original 10,000 rows. 
+```{r}
+print(prop.table(table(customers$invalid)))
+```
+
+We will remove our questionable records, the columns for categories with little separation, and zip code as we will not be using it for this analysis. 
+```{r clean_parition}
+customers_clean <- customers %>%
+  filter(invalid == FALSE) %>%
+  select(-zipcode, -Purchaseswim, -Purchaseeco, -Purchasejackets, -invalid)
+
+print(glimpse(customers_clean))
+```
+
+```{r data_quality_clean}
+customers_clean_num_summary <- df_num_summary(df = customers_clean)
+
+# display in table
+kable(customers_clean_num_summary 
+      #,type = "html"
+      ) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left", 
+                latex_options = "scale_down")
+```
+
+**Variable Creation**
+
+To assist with our strategic marketing goals, we will create four new variables:
+
+  + Customer Lifecyle Segment
+  + Customer Value Segment (purchases in last year)
+  + Customer Value Segment (purchases in last two years)
+  + Value Migration (change from last two years to last year)
+  
+
+We will define customer lifecycle segments based on days since first/last purchase:
+
+  + 0 - 90 days for first purchase (new customer) 
+  + 91 - 180 days (active customer)
+  + 180 - 365 days (at-risk)
+  + Greater than 365 days (inactive customer).
+
+```{r}
+customers_clean$lifecycle <- ifelse(customers_clean$dayssincefirst <= 90 
+                                 & customers_clean$dayssincelast <= 90, "New",
+                                 ifelse(customers_clean$dayssincelast <= 180, "Active",
+                                        ifelse(customers_clean$dayssincelast <= 365, "At-Risk",
+                                               "Inactive")))
+
+customers_clean$lifecycle <- factor(customers_clean$lifecycle)
+```
+
+
+We will define value segments based on percentiles of value:
+
+  + Top 10% (high-value)
+  + Next 50% (medium-value)
+  + Bottom 40% (low-value)
+
+```{r}
+# note: originally had the bottom 30%, but purchases of $0 went past 30th percentile
+apply_value_segment <- function(x) {
+  cut(x, breaks = c(quantile(x, probs = c(0, 0.4, 0.9, 1))), 
+      labels = c("Low", "Medium", "High"), include.lowest=TRUE)
+}
+# apply value segmentations
+customers_clean$value_seg_1yr <- factor(apply_value_segment(customers_clean$purchlast1year))
+customers_clean$value_seg_2yr <- factor(apply_value_segment(customers_clean$purchlast2years))
+
+# determine value migration from 2-year window to 1-year window
+no_change <- (customers_clean$value_seg_2yr == customers_clean$value_seg_1yr)
+increase <- ((customers_clean$value_seg_2yr == "Low" 
+              & customers_clean$value_seg_1yr %in% c("Medium", "High")) | 
+             (customers_clean$value_seg_2yr == "Medium" 
+              & customers_clean$value_seg_1yr == "High"))
+decrease <- ((customers_clean$value_seg_2yr == "High" 
+              & customers_clean$value_seg_1yr %in% c("Medium", "Low")) | 
+             (customers_clean$value_seg_2yr == "Medium" 
+              & customers_clean$value_seg_1yr == "Low"))
+
+# apply value migrations
+customers_clean$value_change <- factor(ifelse(decrease, "Decrease",
+                                              ifelse(no_change, "Neutral",
+                                                     "Increase")))
+
+```
+
+Lastly, we will get an understanding of our new categorial variables to confirm our classifications and understand the value migration. 
+
+We see that 44% of our dataset are inactive customers and another 42% are active customers. 77% of the customers have maintained their value segment with 11% moving upward to a higher value segment. 
+```{r}
+# create function to run summary on categorical features
+df_cat_summary <- function(df, cols = NULL) {
+
+  if (is.null(cols)) {
+    cat.cols <- colnames(select_if(df, is.factor))
+  } else {
+    cat.cols <- cols
+  }
+
+  df <- subset(df, select = cat.cols)
+
+  df.cat.summary <- data.frame(
+     Count = round(sapply(df, length), 2),
+     Miss = round(sapply(df, function(x) sum(length(which(is.na(x)))) / length(x)), 2),
+     Card. = round(sapply(df, function(x) length(unique(x))), 2),
+     Mode = names(sapply(df, function(x) sort(table(x), decreasing = TRUE)[1])),
+     Mode_Freq = sapply(df, function(x) sort(table(x), decreasing = TRUE)[1]),
+     Mode_pct = round((sapply(df, function(x) sort(table(x), 
+                                                   decreasing = TRUE)[1] / length(x)) * 100), 1),
+     Mode_2 = names(sapply(df, function(x) sort(table(x), decreasing = TRUE)[2])),
+     Mode_Freq_2 = sapply(df, function(x) sort(table(x), decreasing = TRUE)[2]),
+     Mode_pct_2 = round((sapply(df, function(x) sort(table(x), 
+                                                     decreasing = TRUE)[2] / length(x)) * 100), 1)
+       )
+
+  df.cat.summary$Mode <- gsub("^.*\\.","", df.cat.summary$Mode)
+  df.cat.summary$Mode_2 <- gsub("^.*\\.","", df.cat.summary$Mode_2)
+
+  df.cat.summary <- df.cat.summary %>% 
+    rename(`Miss Pct.` = Miss,
+           `Mode Freq.` = Mode_Freq, 
+           `Mode Pct.` = Mode_pct,
+           `2nd Mode` = Mode_2,
+           `2nd Mode Freq.` = Mode_Freq_2, 
+           `2nd Mode Pct.` = Mode_pct_2
+           )
+
+    return(df.cat.summary)
+}
+
+# create categorical summary
+customers_clean_cat_summary <- df_cat_summary(df = customers_clean)
+
+# display in table
+kable(customers_clean_cat_summary
+      #, type = "html"
+      ) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left", 
+                latex_options = "scale_down")
+```
+
+
+
+## Model Prototyping
+
+### Postcard Response Prediction
+The first part of our analytics model development will focus on a predictive model to obtain probabilities for customers to respond with a purchase to postcards. 
+
+For our predictive model, we are going to focus on our non-value segmentation variables and use 10-fold  cross-validation on a 75/25 train/test split to choose the best logistic regression model. Need be, we can explore more complex models to understand a customer's propensity to respond to the postcard. 
+
+```{r train_test_partition}
+# set random seed for reproducibility
+set.seed(123)
+
+# create 75/25 split of train and test data indices
+trainIndex <- createDataPartition(customers_clean$purchasepostcard, p = .75, 
+                                  list = FALSE, 
+                                  times = 1)
+
+# create partitions
+customers_clean$split <- ifelse(row.names(customers_clean) %in% trainIndex,
+                                "Train",
+                                "Test")
+
+# convert reponse variable to categorical
+customers_clean$purchasepostcard <- factor(ifelse(customers_clean$purchasepostcard == 1,
+                                                  "Yes", "No"))
+```
+
+** Logistic Regression **
+
+*Model 1*
+
+Our first model is a logistic regression model with all of our variables. Our evaluation metric of interest will be the ROC score, which evaluates the trade-off between the true-positive rate (sensitivity) and the true-negative rate (specificity). Using all the variables, we see a very high ROC score of 98%. 
+
+In this case, *not making a purchase* is the positive class, so sensitivty refers to predciting a non-purchaser while specificity refers to a purchaser. We will flip these when evaluating the test set. 
+
+```{r}
+mod1_formula <- {purchasepostcard ~ dayssincefirst + dayssincelast + PurchaseMen + 
+    Purchasekids + Purchasesports + sharehighfashion + purchaseonline + purchlast1year +
+    purchlast2years + age + clubmember + emailsubscriber + salesdriven + lifecycle}
+
+# add controls for training model
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10,
+                     repeats = 5,
+                     summaryFunction = twoClassSummary, 
+                     classProbs = TRUE
+                     )
+
+# set seed to compare models
+set.seed(123)
+# build model using training set
+glm_all <- train(mod1_formula, 
+                 data = customers_clean[customers_clean$split == "Train", ],
+                 method = "glm",
+                 metric = "ROC",
+                 trControl = ctrl)
+
+# view results
+print(glm_all)
+
+# view summary
+print(summary(glm_all$finalModel))
+
+# assess model
+print(anova(glm_all$finalModel, test="Chisq"))
+```
+
+*Model 2*
+
+Based on the variables that lack statistical significance and low deviance reduction, we will reduce the number of variables in our logistic model and re-test. First, we will create a flag to indicate if the customer is an inactive customer and then discard the general lifecycle variable. 
+
+Additionally, we will remove variables indicating Club Member, Mens category, and sports category. We will also remove the variable for days since frist purchase. The remaining vairables showed as statistically signficant in our summary output and produced double-digit residual deviance reduction.
+
+Our second logistic regression model shows that customers that are email subscribers, sales driven, and have higher share of purchases being high fashion are most likely to respond to the postcard. On the flip side, inactive customers (> 365 days since last purchase) show much lower odds of responding to a postcard. Simply, removing inactive customers from the list of potential postcard customers could greatly reduce the cost and increase the conversion rate of postcards. 
+
+We are able to improve our ROC and sensitivity scores slightly and maintain a very good ROC score above 98%, so we will move forward with testing our model on the test set to see how it performs on new data. 
+
+```{r}
+
+customers_clean$inactive <- ifelse(customers_clean$lifecycle == "Inactive", 1, 0)
+
+mod2_formula <- {purchasepostcard ~  dayssincelast + 
+    sharehighfashion + purchaseonline + purchlast1year +
+    purchlast2years + age + emailsubscriber + salesdriven + inactive}
+
+# add controls for training model
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10,
+                     repeats = 5,
+                     summaryFunction = twoClassSummary, 
+                     classProbs = TRUE
+                     )
+
+# set seed to compare models
+set.seed(123)
+# build model using training set
+glm_mod_2 <- train(mod2_formula, 
+                 data = customers_clean[customers_clean$split == "Train", ],
+                 method = "glm",
+                 metric = "ROC",
+                 trControl = ctrl)
+
+# view results
+print(glm_mod_2)
+
+# view summary
+print(summary(glm_mod_2$finalModel))
+
+# assess model
+print(anova(glm_mod_2$finalModel, test="Chisq"))
+```
+
+
+
+**Model Test Evaluation**
+
+To assess the performance of our model, we will make predictions on the test set and review the confusion matrix and ROC scores.  
+
+```{r}
+# partition test set for evaluation
+customers_test <- customers_clean[customers_clean$split == "Test", ]
+
+# predicted probabilities for test set
+glmTestPred <- predict(glm_mod_2, 
+                       customers_test,
+                       type = "prob")
+
+# extract probability of purchase
+customers_test$glm_prob <- glmTestPred[ , "Yes"]
+# extract class assignment
+customers_test$glm_class <- predict(glm_mod_2, customers_test)
+
+# create confusion matrix
+confusionMatrix(data = customers_test$glm_class,
+                reference = customers_test$purchasepostcard,
+                positive = "Yes")
+```
+
+We can assess the ROC curve and generate the area under the ROC curve for the test set. We see we are still able to maintain our ROC score to the test sit, which is a good indication of how well our model will generalize to a similar set of customers. 
+
+
+```{r}
+rocCurve <- roc(response = customers_test$purchasepostcard, 
+                predictor = customers_test$glm_prob, 
+                levels = rev(levels(customers_test$purchasepostcard)))
+
+# ROC score of test set
+auc(rocCurve)
+
+# plot of ROC curve
+plot(rocCurve, main = "Logistic Regression ROC Curve")
+```
+
+Viewing the lift curve of our model, we see the logistic regression does an excellent job at detecting customers that made a purchase from the postcard. 
+
+```{r}
+liftCurve <- lift(purchasepostcard ~ glm_prob, data = customers_test,
+                  class = "Yes")
+
+plot(liftCurve, main = "Logistic Regression Lift Curve")
+```
+
+Based on the results of the prediction model, we are comfortable moving forward with testing the logistic regression model on the next batch of customers that are similar to those in this sample. Additionally, we have identified potential drivers of responding to the postcard with a purchase and can eliminate inactive customers from the distribution list. 
+
+### Customer Segmentation Clustering
+
+So far we have learned that this dataset appears to be a sample of customers that primarily shop the Swim, Eco, and Jackets categories. We have already created potential customer segmentations via customer value over the last one year, customer value over the last 2 years, customer value migration, and the stage of the customer lifecycle journey. 
+
+We will explore finding additional clusters in the dataset using 9 variables of customer purchase behavior and attributes. Since we will be using variables mixed variables in our clustering experiement, we will need to use a distance metric that can handle mixed data types (Gower's distance -- each data type receives a distance calculation that works well with it). 
+
+We will explore clusters ranging from 2 to 10 in order to ensure the results are managable for marketing strategies to be developed. Too many clusters may result in the inability to create campaigns for each cluster. 
+
+```{r}
+cluster_vars <- c("PurchaseMen", "Purchasekids", "Purchasesports", "sharehighfashion",
+                  "purchaseonline", "clubmember", "emailsubscriber", "salesdriven",
+                  "purchasepostcard")
+
+gower_dist <- daisy(customers_clean[ , cluster_vars],
+                    metric = "gower")
+
+summary(gower_dist)
+```
+
+To assess our clustering outcomes, we will use the silhouette width to select the optimal number of clusters. This metric is a measure of how similar the points within the cluster are to one another with values ranging from -1 to 1 and larger values being better. 
+
+Our results show a k of 2 producing the largest silhouette width. 
+
+```{r}
+
+# Calculate silhouette width for many k values up to 10 clusters 
+sil_width <- c(NA)
+
+for(i in 2:10){
+  
+  pam_fit <- pam(gower_dist,
+                 diss = TRUE,
+                 k = i)
+  
+  sil_width[i] <- pam_fit$silinfo$avg.width
+  
+}
+
+# plot silhouette width to determine k with highest value (intra-cluster similarity metric)
+ggplot() +
+  geom_line(aes(x = 2:10, y = sil_width[2:10]))  +
+  geom_point(aes(x = 2:10, y = sil_width[2:10])) +
+  labs(y = "Silhouette Width", x = "K-value", title = "K-Means Clustering",
+       subtitle = "Partitioning Around Medoids (PAM)")
+```
+
+We will move forward with 2 clusters and see what the results of our segmentation for this customer sample look like. One benefit of the PAM method is that the medoids represent best examples (center) of each cluster. So in additional to summary statistics of each cluster, we can use an actual record to develop a persona for each customer segementation group. 
+
+In reviewing the cluster summary, we can see that most of our customers fall into cluster #1. Cluster #1 contains customers that have a low propensity to Men and Kids categories and an affinity for the Sports category. They consist mainly of inactive, low to medium value customers. This cluster also skews towards in-store purchases with a lower response rate to postcards. 
+
+On the other hand, cluster #2 has customers with a larger affinity towards the Mens and Kids categories, skews towards online purchases, is more prone to be an email subscriber, is more sales driven, has a higher propensity to purchase via postcards, and consists of higher value, active customers. These customers also have a much more recent purchase timeframe with a median of 53 days and average of 66 days since their last purchase. 
+
+```{r}
+# fit a k=2 PAM model
+pam_fit_2 <- pam(gower_dist, diss = TRUE, k = 2)
+
+# assign clusters to the original dataset
+customers_clean$cluster <- pam_fit_2$clustering
+
+# summarize based on cluster number
+cluster_summary <- customers_clean %>%
+  group_by(cluster) %>%
+  do(the_summary = summary(.))
+
+# display summary
+print(cluster_summary$the_summary)
+```
+
+Information from each of these clusters can be used to create campaigns to target customers in each cluster. For example, customer in cluster 2 can be provided messaging around new items with sales promotions sprinkled in based on the value of the customer. Customers in cluster 1 can be targeted with campaigns for sports with the intent of re-activating lapsed customers. Offers can be considered based on the value change of the customer with customers showing increases in value getting deeper offers as an incentive to re-engage. 
+
+### New Customers
+
+There are a handful of steps we can take to increase the liklihood of a new customer returning. The simplest strategy is to send new customers a "Thank You" follow-up, whether by e-mail or traditional mail. This can start from the moment the customer received their order in the mail, or from the store associate ringing up the transaction. If a customer is flagged in the system as being a new customer, processes can trigger to engage these customers differently over the course of the next 90 days. 
+
+In addition to a genuine "Thank you," these customers should be provided with information that helps them succeed in their relationship with H&M. What resources can these customers be given that provides them value WITHOUT having to transact again? For example, is there a free newsletter, style guide, etc. that can be sent to the customer to help educate them on other styles that might go well with their purchase? 
+
+As this process gets going, additional analytical steps can be taken to identify predictors of a high-value customer and/or what items they might want to buy next. For example, are there certain items that over-index in terms of high-value customer acquisition? Is there market basket analysis data available on these particular items to develop a drip campaign that consists of H&M resources along with offers for additional items? What channels or offers do customers typically engage with for their 2nd and 3rd purchases? Do they respond to email campaigns, or is their repeat purchase agnostic of any offer? Do they purchase a similar or complimentary item?
+
+To add additional fuel to the cycle, what customer feedback data is available? How do new customers rate their satisfaction and how do eventual repeat customers compare to those that churn? Are their common topics in the comments or areas of improvement that are available in order to drive the satisfaction of future new customers?
+
+## Results Activation
+
+To conclude, we have several key takeaways as it relates to our initial business goals to activate our results.
+
+**1. Postcard Send-Outs**
+
+We have postcards in several markets and would like to send them to the right customer.
+  
+  + Use the logistic regression model to predict the probability of a customer responding to a postcard and monitor results over time
+  + Remove inactive customers from the potential pool of recipients and develop a separate re-activation campaign
+  + Create regression model to predict value of response to postcard and then in conjunction with the logistic model, determine the expected value of mailing a postcard to each customer
+      + Only mail postcards to customers with an expected value greater than the cost of the postcard
+  
+
+**2. Strategic Segmentation**
+
+We want to learn more about our customer base to support customer insight in the organization. We also want to use it for how we will work with customers, e.g. which customer groups we will target different activities.
+  
+  + Use results of the clustering to better understand the attributes of micro-customer groups and tailor marketing campaigns accordingly
+  + Depending on the availability of resources, perform the clustering segmentation to include a larger number of clusters for more specific targeting
+  + Obtain additional relevant variables to include in the results
+  + Create humanized personas that summarize the behavior of these customers to distribute to relevant parties within the organization (e.g.  "This is Jane. She subscribes to emails and likes to make online purchases.")
+
+**3. New Customers**
+
+A project that works with Online customers needs our analytical help. Many customers shop once, but never come back. How do we get new customers to return?
+
+  + Map out the customer journey lifecycle and develop marketing strategies that trigger based on different phases
+  + Start simple and thank new customers for starting a relationship with H&M and identify ways to provide customer value outside of transactions
+  + Apply data-mining techniques to understand predictors of high-value customers and use results to drip incentives in egagement for the customer to repeat purchase (e.g. relevant product promotional offers)
+  + Leverage customer feedback to understand drivers of satisfaction and how to relate to increased purchase frequency
